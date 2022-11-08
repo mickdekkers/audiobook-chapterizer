@@ -8,5 +8,5 @@ edition = "2021"
 [dependencies]
 arrayvec = "0.7.2"
 itertools = "0.10.5"
-rodio = { version = "0.16.0", features = ["symphonia-all"] }
+symphonia = { version = "0.5.1", features = ["mp3", "isomp4", "aac", "alac"] }
 vosk = "0.2.0"
