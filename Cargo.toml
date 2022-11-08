@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 arrayvec = "0.7.2"
-hound = "3.5.0"
 itertools = "0.10.5"
+rodio = { version = "0.16.0", features = ["symphonia-all"] }
 vosk = "0.2.0"
