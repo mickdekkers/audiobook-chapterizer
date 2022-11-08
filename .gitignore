@@ -1,0 +1,4 @@
+/target
+/native-libs
+/vosk-model-*
+*.wav
