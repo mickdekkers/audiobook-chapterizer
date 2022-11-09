@@ -14,6 +14,8 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "itertools",
+ "serde",
+ "serde_json",
  "symphonia",
  "vosk",
 ]
