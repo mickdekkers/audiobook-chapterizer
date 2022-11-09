@@ -14,7 +14,7 @@ use arrayvec::ArrayVec;
 use audiobook_chapterizer::gimme_audio;
 use itertools::Itertools;
 use std::io::Write;
-use vosk::{CompleteResult, Model, Recognizer};
+use vosk::{Alternative, CompleteResult, CompleteResultMultiple, Model, Recognizer};
 
 const SAMPLES_BUFFER_SIZE: usize = 8 * 1024; // 8 kb
 
@@ -24,10 +24,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 // TODO: create function that returns iterator of recognition results
 
-// CompleteResult has borrowed data which relies on a recognizer.
+// Alternative has borrowed data which relies on a recognizer.
 // We serialize the data before passing it between threads to work around this.
-fn serialize_result(result: CompleteResult) -> String {
-    serde_json::to_string(&result).expect("json serialization should not fail")
+fn serialize_alternative(result: &Alternative) -> String {
+    serde_json::to_string(result).expect("json serialization should not fail")
 }
 
 fn format_duration(duration: &Option<Duration>) -> String {
@@ -48,6 +48,18 @@ fn format_duration(duration: &Option<Duration>) -> String {
         seconds,
         millis / 10
     )
+}
+
+/// Attempts to find the start of a chapter in a candidate prediction result
+fn get_chapter_start<'a>(candidate: &'a CompleteResultMultiple) -> Option<&'a Alternative<'a>> {
+    candidate.alternatives.iter().find(|alt| {
+        // The first word in the predicted sentence should be "chapter", to reduce false positives
+        // of the word appearing in the middle of a sentence
+        alt.result
+            .first()
+            .map(|r| r.word == "chapter")
+            .unwrap_or(false)
+    })
 }
 
 fn main() {
@@ -88,9 +100,6 @@ fn main() {
     let result_writer_handle = thread::spawn(move || {
         let mut file = File::create("output.jsonl").expect("failed to create output file");
         while let Ok(msg) = rw_rx.recv() {
-            if !msg.contains("chapter") {
-                continue;
-            }
             eprintln!("Writing {} bytes to output file", msg.len());
             file.write_all((format!("{}\n", msg)).as_bytes())
                 .expect("failed to write buffer to output file");
@@ -148,6 +157,13 @@ fn main() {
         }
     });
 
+    let process_result = |result: CompleteResult| {
+        let multi = result.multiple().unwrap();
+        if let Some(alt) = get_chapter_start(&multi) {
+            rw_tx.send(serialize_alternative(alt)).unwrap();
+        }
+    };
+
     for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
         for sample in chunk {
             // let sample = sample_result.expect("Error reading sample");
@@ -156,15 +172,13 @@ fn main() {
         }
 
         if let vosk::DecodingState::Finalized = recognizer.accept_waveform(&buffer) {
-            rw_tx.send(serialize_result(recognizer.result())).unwrap();
+            process_result(recognizer.result());
         }
 
         buffer.clear();
     }
 
-    rw_tx
-        .send(serialize_result(recognizer.final_result()))
-        .unwrap();
+    process_result(recognizer.final_result());
     pp_stop_tx.send(()).unwrap();
     drop(rw_tx);
     drop(pp_stop_tx);
