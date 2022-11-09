@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::fs::File;
+use std::time::Duration;
 
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::conv::FromSample;
 use symphonia::core::errors::Error;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, Track};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -13,7 +14,7 @@ use symphonia::core::probe::Hint;
 pub struct AudioProvider {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
-    track_id: u32,
+    track_info: Track,
     queue: VecDeque<i16>,
     sample_rate: u32,
 }
@@ -54,23 +55,27 @@ impl AudioProvider {
             .make(&track.codec_params, &dec_opts)
             .expect("unsupported codec");
 
-        // Store the track identifier, it will be used to filter packets.
-        let track_id = track.id;
-
         Self {
             sample_rate: track
                 .codec_params
                 .sample_rate
                 .expect("no sample rate in track metadata"),
+            track_info: track.clone(),
             format,
             decoder,
-            track_id,
             queue: VecDeque::new(),
         }
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    pub fn total_duration(&self) -> Option<Duration> {
+        let time_base = self.track_info.codec_params.time_base?;
+        let n_frames = self.track_info.codec_params.n_frames?;
+        let time = time_base.calc_time(n_frames);
+        Some(Duration::from_secs_f64(time.seconds as f64 + time.frac))
     }
 }
 
@@ -125,7 +130,7 @@ impl Iterator for AudioProvider {
             }
 
             // If the packet does not belong to the selected track, skip over it.
-            if packet.track_id() != self.track_id {
+            if packet.track_id() != self.track_info.id {
                 continue;
             }
 

@@ -30,6 +30,26 @@ fn serialize_result(result: CompleteResult) -> String {
     serde_json::to_string(&result).expect("json serialization should not fail")
 }
 
+fn format_duration(duration: &Option<Duration>) -> String {
+    let duration = match duration {
+        Some(duration) => duration,
+        None => return "??".into(),
+    };
+
+    let millis = duration.subsec_millis();
+    let seconds = duration.as_secs() % 60;
+    let minutes = (duration.as_secs() / 60) % 60;
+    let hours = (duration.as_secs() / 60) / 60;
+
+    format!(
+        "{:02}:{:02}:{:02}.{:02}",
+        hours,
+        minutes,
+        seconds,
+        millis / 10
+    )
+}
+
 fn main() {
     let mut args = env::args();
     args.next();
@@ -47,6 +67,8 @@ fn main() {
     // let sample_rate = source.sample_rate();
     let num_channels = 1;
     let sample_rate = ap.sample_rate();
+    let total_duration = ap.total_duration();
+
     let calc_progress_in_secs = move |current_samples: u64| {
         current_samples as f32 / sample_rate as f32 / num_channels as f32
     };
@@ -69,7 +91,7 @@ fn main() {
             if !msg.contains("chapter") {
                 continue;
             }
-            println!("Writing {} bytes to output file", msg.len());
+            eprintln!("Writing {} bytes to output file", msg.len());
             file.write_all((format!("{}\n", msg)).as_bytes())
                 .expect("failed to write buffer to output file");
         }
@@ -100,12 +122,24 @@ fn main() {
                 Duration::from_secs_f32(calc_progress_in_secs(current_samples));
             let processed_duration_delta =
                 Duration::from_secs_f32(calc_progress_in_secs(current_samples - last_samples));
+            let progress_percent = total_duration.map(|td| {
+                f32::min(
+                    f32::max(
+                        processed_duration.as_secs_f32() / td.as_secs_f32() * 100.0,
+                        0.0,
+                    ),
+                    100.0,
+                )
+            });
 
-            // TODO: obtain total duration and calculate progress percentage
-            // TODO: pretty format duration
             eprintln!(
-                "Progress: {:.3} seconds / ??, speed= {:.2}x",
-                processed_duration.as_secs_f32(),
+                "Progress: {} @ {} of {}, speed= {:.2}x",
+                match progress_percent {
+                    Some(pct) => format!("{:05.2}%", pct),
+                    None => "??%".into(),
+                },
+                format_duration(&Some(processed_duration)),
+                format_duration(&total_duration),
                 processed_duration_delta.as_secs_f32() / time_delta.as_secs_f32()
             );
 
@@ -137,12 +171,11 @@ fn main() {
     result_writer_handle.join().unwrap();
     progress_printer_handle.join().unwrap();
 
-    // println!("{:#?}", recognizer.final_result().single().unwrap());
     let end_time = Instant::now();
     let secs_processed = calc_progress_in_secs(total_samples.load(Ordering::SeqCst));
     let time_elasped = end_time - start_time;
     eprintln!(
-        "Processed {:.3} seconds of audio in {:.3} seconds ({:.3}x RT)",
+        "Processed {:.2} seconds of audio in {:.2} seconds ({:.2}x RT)",
         secs_processed,
         time_elasped.as_secs_f32(),
         secs_processed / time_elasped.as_secs_f32()
