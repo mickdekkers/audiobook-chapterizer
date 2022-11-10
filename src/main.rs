@@ -11,10 +11,12 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use audiobook_chapterizer::gimme_audio;
+use audiobook_chapterizer::{
+    format_duration, get_chapter_start, gimme_audio, serialize_alternative,
+};
 use itertools::Itertools;
 use std::io::Write;
-use vosk::{Alternative, CompleteResult, CompleteResultMultiple, Model, Recognizer};
+use vosk::{CompleteResult, Model, Recognizer};
 
 const SAMPLES_BUFFER_SIZE: usize = 8 * 1024; // 8 kb
 
@@ -23,44 +25,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 // TODO: find a way to parallelize the workload
 
 // TODO: create function that returns iterator of recognition results
-
-// Alternative has borrowed data which relies on a recognizer.
-// We serialize the data before passing it between threads to work around this.
-fn serialize_alternative(result: &Alternative) -> String {
-    serde_json::to_string(result).expect("json serialization should not fail")
-}
-
-fn format_duration(duration: &Option<Duration>) -> String {
-    let duration = match duration {
-        Some(duration) => duration,
-        None => return "??".into(),
-    };
-
-    let millis = duration.subsec_millis();
-    let seconds = duration.as_secs() % 60;
-    let minutes = (duration.as_secs() / 60) % 60;
-    let hours = (duration.as_secs() / 60) / 60;
-
-    format!(
-        "{:02}:{:02}:{:02}.{:02}",
-        hours,
-        minutes,
-        seconds,
-        millis / 10
-    )
-}
-
-/// Attempts to find the start of a chapter in a candidate prediction result
-fn get_chapter_start<'a>(candidate: &'a CompleteResultMultiple) -> Option<&'a Alternative<'a>> {
-    candidate.alternatives.iter().find(|alt| {
-        // The first word in the predicted sentence should be "chapter", to reduce false positives
-        // of the word appearing in the middle of a sentence
-        alt.result
-            .first()
-            .map(|r| r.word == "chapter")
-            .unwrap_or(false)
-    })
-}
 
 fn main() {
     let mut args = env::args();
@@ -91,7 +55,6 @@ fn main() {
     let start_time = Instant::now();
 
     let (rw_tx, rw_rx) = channel::unbounded::<String>();
-
     let result_writer_handle = thread::spawn(move || {
         let mut file = File::create("output.jsonl").expect("failed to create output file");
         while let Ok(msg) = rw_rx.recv() {
@@ -100,9 +63,6 @@ fn main() {
                 .expect("failed to write buffer to output file");
         }
     });
-
-    let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
-    // TODO: is there a faster way to keep reading the samples into a buffer?
 
     let total_samples = Arc::new(AtomicU64::new(0));
 
@@ -159,6 +119,8 @@ fn main() {
         }
     };
 
+    let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
+    // TODO: is there a faster way to keep reading the samples into a buffer?
     for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
         for sample in chunk {
             buffer.push(sample);
