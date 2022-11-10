@@ -71,12 +71,7 @@ fn main() {
         .next()
         .expect("A path for the audio file to be read was not provided");
 
-    // let file = std::fs::File::open(audio_file_path).expect("Could not open file");
     let ap = gimme_audio(&audio_file_path);
-    // let buf_reader = std::io::BufReader::with_capacity(SAMPLES_BUFFER_SIZE * 8, file);
-    // let source = Decoder::new(file).expect("Could not create the audio reader");
-    // let num_channels = source.channels();
-    // let sample_rate = source.sample_rate();
     let num_channels = 1;
     let sample_rate = ap.sample_rate();
     let total_duration = ap.total_duration();
@@ -166,7 +161,6 @@ fn main() {
 
     for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
         for sample in chunk {
-            // let sample = sample_result.expect("Error reading sample");
             buffer.push(sample);
             total_samples.store(total_samples.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
         }
