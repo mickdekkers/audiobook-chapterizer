@@ -1,5 +1,6 @@
 use crossbeam::channel;
 use std::{
+    ffi::{OsStr, OsString},
     fs::File,
     path::PathBuf,
     sync::{
@@ -14,7 +15,10 @@ use arrayvec::ArrayVec;
 use audiobook_chapterizer::{
     format_duration, get_chapter_start, gimme_audio, serialize_alternative,
 };
-use clap::{ArgAction, Parser};
+use clap::{
+    builder::{OsStringValueParser, TypedValueParser},
+    ArgAction, Parser,
+};
 use color_eyre::eyre::{self, Context, ContextCompat};
 use itertools::Itertools;
 use log::LevelFilter;
@@ -29,16 +33,33 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 // TODO: create function that returns iterator of recognition results
 
+fn verify_jsonl_ext(os: OsString) -> Result<PathBuf, &'static str> {
+    let path = PathBuf::from(os);
+    if path.extension() != Some(OsStr::new("jsonl")) {
+        return Err("path must end in .jsonl");
+    }
+    Ok(path)
+}
+
 #[derive(Parser)]
 struct Cli {
     /// Makes logging more verbose. Pass once for debug log level, twice for trace log level.
     #[clap(short, action = ArgAction::Count, global = true)]
     verbose: u8,
-    /// The path to the Vosk ASR model to use.
-    #[clap(long, default_value = "./model")]
-    model: PathBuf,
-    /// The audio file to chapterize.
-    audio_file: PathBuf,
+    /// The path to the Vosk ASR model directory to use.
+    #[clap(value_name = "model_dir", long = "model", default_value = "./model")]
+    model_dir_path: PathBuf,
+    /// Optionally, a path to a file to write matching recognition results to. The path must end in
+    /// .jsonl
+    #[clap(
+        value_name = "matches_file",
+        long = "write_matches",
+        value_parser = OsStringValueParser::new().try_map(verify_jsonl_ext)
+    )]
+    matches_file_path: Option<PathBuf>,
+    /// The path to the audio file to chapterize.
+    #[clap(value_name = "audio_file", short = 'i')]
+    audio_file_path: PathBuf,
 }
 
 fn main() -> Result<(), eyre::Error> {
@@ -52,7 +73,7 @@ fn main() -> Result<(), eyre::Error> {
         })
         .init();
 
-    let ap = gimme_audio(&cli.audio_file)?;
+    let ap = gimme_audio(&cli.audio_file_path)?;
     let num_channels = 1;
     let sample_rate = ap.sample_rate();
     let total_duration = ap.total_duration();
@@ -61,7 +82,8 @@ fn main() -> Result<(), eyre::Error> {
         current_samples as f32 / sample_rate as f32 / num_channels as f32
     };
 
-    let model = Model::new(cli.model.to_string_lossy()).wrap_err("Failed to load the model")?;
+    let model =
+        Model::new(cli.model_dir_path.to_string_lossy()).wrap_err("Failed to load the model")?;
     let mut recognizer =
         Recognizer::new(&model, sample_rate as f32).wrap_err("Failed to create the recognizer")?;
 
@@ -72,12 +94,27 @@ fn main() -> Result<(), eyre::Error> {
     let start_time = Instant::now();
 
     let (rw_tx, rw_rx) = channel::unbounded::<String>();
-    let mut file = File::create("output.jsonl").wrap_err("Failed to create output file")?;
+    let mut file = match cli.matches_file_path {
+        Some(matches_file_path) => {
+            Some(File::create(matches_file_path).wrap_err("Failed to create output file")?)
+        }
+        None => None,
+    };
     let result_writer_handle = thread::spawn(move || {
         while let Ok(msg) = rw_rx.recv() {
-            log::debug!("Writing {} bytes to output file", msg.len());
-            file.write_all((format!("{}\n", msg)).as_bytes())
-                .expect("Failed to write buffer to output file");
+            match &mut file {
+                Some(file) => {
+                    log::debug!("Writing {} bytes to output file", msg.len());
+                    file.write_all((format!("{}\n", msg)).as_bytes())
+                        .expect("Failed to write buffer to output file");
+                }
+                None => {
+                    log::debug!(
+                        "No matches file specified, skipped writing {} bytes",
+                        msg.len()
+                    );
+                }
+            }
         }
     });
 
