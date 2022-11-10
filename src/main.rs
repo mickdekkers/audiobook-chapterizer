@@ -1,7 +1,7 @@
 use crossbeam::channel;
 use std::{
-    env,
     fs::File,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -14,7 +14,10 @@ use arrayvec::ArrayVec;
 use audiobook_chapterizer::{
     format_duration, get_chapter_start, gimme_audio, serialize_alternative,
 };
+use clap::{ArgAction, Parser};
+use color_eyre::eyre::{self, Context, ContextCompat};
 use itertools::Itertools;
+use log::LevelFilter;
 use std::io::Write;
 use vosk::{CompleteResult, Model, Recognizer};
 
@@ -26,16 +29,30 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 // TODO: create function that returns iterator of recognition results
 
-fn main() {
-    let mut args = env::args();
-    args.next();
+#[derive(Parser)]
+struct Cli {
+    /// Makes logging more verbose. Pass once for debug log level, twice for trace log level.
+    #[clap(short, action = ArgAction::Count, global = true)]
+    verbose: u8,
+    /// The path to the Vosk ASR model to use.
+    #[clap(long, default_value = "./model")]
+    model: PathBuf,
+    /// The audio file to chapterize.
+    audio_file: PathBuf,
+}
 
-    let model_path = args.next().expect("A model path was not provided");
-    let audio_file_path = args
-        .next()
-        .expect("A path for the audio file to be read was not provided");
+fn main() -> Result<(), eyre::Error> {
+    color_eyre::install()?;
+    let cli = Cli::parse();
+    env_logger::Builder::new()
+        .filter_level(match cli.verbose {
+            0 => LevelFilter::Info,
+            1 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        })
+        .init();
 
-    let ap = gimme_audio(&audio_file_path);
+    let ap = gimme_audio(&cli.audio_file)?;
     let num_channels = 1;
     let sample_rate = ap.sample_rate();
     let total_duration = ap.total_duration();
@@ -44,9 +61,9 @@ fn main() {
         current_samples as f32 / sample_rate as f32 / num_channels as f32
     };
 
-    let model = Model::new(model_path).expect("Could not create the model");
+    let model = Model::new(cli.model.to_string_lossy()).wrap_err("Failed to load the model")?;
     let mut recognizer =
-        Recognizer::new(&model, sample_rate as f32).expect("Could not create the recognizer");
+        Recognizer::new(&model, sample_rate as f32).wrap_err("Failed to create the recognizer")?;
 
     recognizer.set_max_alternatives(3);
     recognizer.set_words(true);
@@ -55,12 +72,12 @@ fn main() {
     let start_time = Instant::now();
 
     let (rw_tx, rw_rx) = channel::unbounded::<String>();
+    let mut file = File::create("output.jsonl").wrap_err("Failed to create output file")?;
     let result_writer_handle = thread::spawn(move || {
-        let mut file = File::create("output.jsonl").expect("failed to create output file");
         while let Ok(msg) = rw_rx.recv() {
-            eprintln!("Writing {} bytes to output file", msg.len());
+            log::debug!("Writing {} bytes to output file", msg.len());
             file.write_all((format!("{}\n", msg)).as_bytes())
-                .expect("failed to write buffer to output file");
+                .expect("Failed to write buffer to output file");
         }
     });
 
@@ -96,7 +113,7 @@ fn main() {
                 )
             });
 
-            eprintln!(
+            log::info!(
                 "Progress: {} @ {} of {}, speed= {:.2}x",
                 match progress_percent {
                     Some(pct) => format!("{:05.2}%", pct),
@@ -151,10 +168,12 @@ fn main() {
     let end_time = Instant::now();
     let secs_processed = calc_progress_in_secs(total_samples.load(Ordering::SeqCst));
     let time_elasped = end_time - start_time;
-    eprintln!(
+    log::info!(
         "Processed {:.2} seconds of audio in {:.2} seconds ({:.2}x RT)",
         secs_processed,
         time_elasped.as_secs_f32(),
         secs_processed / time_elasped.as_secs_f32()
-    )
+    );
+
+    Ok(())
 }

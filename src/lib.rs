@@ -1,13 +1,17 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use audio_provider::AudioProvider;
+use color_eyre::eyre::{self, Context};
 use vosk::{Alternative, CompleteResultMultiple};
 
 mod audio_provider;
 
-pub fn gimme_audio(path: &str) -> AudioProvider {
+pub fn gimme_audio<P>(path: P) -> eyre::Result<AudioProvider>
+where
+    P: AsRef<Path>,
+{
     // Open the media source.
-    let src = std::fs::File::open(&path).expect("failed to open media");
+    let src = std::fs::File::open(&path).wrap_err("Failed to open audio file")?;
 
     AudioProvider::new(src)
 }

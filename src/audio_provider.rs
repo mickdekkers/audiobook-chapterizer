@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::time::Duration;
 
+use color_eyre::eyre::{self, eyre, Context, ContextCompat};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::conv::FromSample;
@@ -20,7 +21,7 @@ pub struct AudioProvider {
 }
 
 impl AudioProvider {
-    pub fn new(src: File) -> Self {
+    pub fn new(src: File) -> eyre::Result<Self> {
         // Create the media source stream.
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -35,7 +36,7 @@ impl AudioProvider {
         // Probe the media source.
         let probed = symphonia::default::get_probe()
             .format(&hint, mss, &fmt_opts, &meta_opts)
-            .expect("unsupported format");
+            .wrap_err("File is of an unsupported format")?;
 
         // Get the instantiated format reader.
         let format = probed.format;
@@ -45,7 +46,7 @@ impl AudioProvider {
             .tracks()
             .iter()
             .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .expect("no supported audio tracks");
+            .ok_or_else(|| eyre!("File contains no supported audio tracks"))?;
 
         // Use the default options for the decoder.
         let dec_opts: DecoderOptions = Default::default();
@@ -53,18 +54,18 @@ impl AudioProvider {
         // Create a decoder for the track.
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &dec_opts)
-            .expect("unsupported codec");
+            .wrap_err("File uses an unsupported codec")?;
 
-        Self {
+        Ok(Self {
             sample_rate: track
                 .codec_params
                 .sample_rate
-                .expect("no sample rate in track metadata"),
+                .wrap_err("File track metadata does not specify sample rate")?,
             track_info: track.clone(),
             format,
             decoder,
             queue: VecDeque::new(),
-        }
+        })
     }
 
     pub fn sample_rate(&self) -> u32 {
