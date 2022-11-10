@@ -67,7 +67,7 @@ fn main() {
     let total_samples = Arc::new(AtomicU64::new(0));
 
     let (pp_stop_tx, pp_stop_rx) = channel::unbounded::<()>();
-    let total_samples_2 = total_samples.clone();
+    let total_samples_clone = total_samples.clone();
     let progress_printer_handle = thread::spawn(move || {
         let mut last_time = Instant::now();
         let mut last_samples = 0u64;
@@ -79,7 +79,7 @@ fn main() {
                 _ => (),
             }
             let current_time = Instant::now();
-            let current_samples = total_samples_2.load(Ordering::SeqCst);
+            let current_samples = total_samples_clone.load(Ordering::SeqCst);
 
             let time_delta = current_time - last_time;
             let processed_duration =
@@ -112,32 +112,38 @@ fn main() {
         }
     });
 
-    let process_result = |result: CompleteResult| {
-        let multi = result.multiple().unwrap();
-        if let Some(alt) = get_chapter_start(&multi) {
-            rw_tx.send(serialize_alternative(alt)).unwrap();
+    let total_samples_clone = total_samples.clone();
+    let asr_handle = thread::spawn(move || {
+        let process_result = |result: CompleteResult| {
+            let multi = result.multiple().unwrap();
+            if let Some(alt) = get_chapter_start(&multi) {
+                rw_tx.send(serialize_alternative(alt)).unwrap();
+            }
+        };
+
+        let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
+        // TODO: is there a faster way to keep reading the samples into a buffer?
+        for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
+            for sample in chunk {
+                buffer.push(sample);
+                total_samples_clone.store(
+                    total_samples_clone.load(Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
+                );
+            }
+
+            if let vosk::DecodingState::Finalized = recognizer.accept_waveform(&buffer) {
+                process_result(recognizer.result());
+            }
+
+            buffer.clear();
         }
-    };
+        process_result(recognizer.final_result());
+    });
 
-    let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
-    // TODO: is there a faster way to keep reading the samples into a buffer?
-    for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
-        for sample in chunk {
-            buffer.push(sample);
-            total_samples.store(total_samples.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
-        }
-
-        if let vosk::DecodingState::Finalized = recognizer.accept_waveform(&buffer) {
-            process_result(recognizer.result());
-        }
-
-        buffer.clear();
-    }
-
-    process_result(recognizer.final_result());
     pp_stop_tx.send(()).unwrap();
-    drop(rw_tx);
     drop(pp_stop_tx);
+    asr_handle.join().unwrap();
     result_writer_handle.join().unwrap();
     progress_printer_handle.join().unwrap();
 
