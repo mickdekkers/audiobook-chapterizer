@@ -139,10 +139,9 @@ fn main() {
             buffer.clear();
         }
         process_result(recognizer.final_result());
+        pp_stop_tx.send(()).unwrap();
     });
 
-    pp_stop_tx.send(()).unwrap();
-    drop(pp_stop_tx);
     asr_handle.join().unwrap();
     result_writer_handle.join().unwrap();
     progress_printer_handle.join().unwrap();
