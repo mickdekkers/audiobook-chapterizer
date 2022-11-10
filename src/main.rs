@@ -124,13 +124,15 @@ fn main() {
         let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
         // TODO: is there a faster way to keep reading the samples into a buffer?
         for chunk in ap.into_iter().chunks(SAMPLES_BUFFER_SIZE).into_iter() {
+            let mut chunk_size = 0usize;
             for sample in chunk {
                 buffer.push(sample);
-                total_samples_clone.store(
-                    total_samples_clone.load(Ordering::SeqCst) + 1,
-                    Ordering::SeqCst,
-                );
+                chunk_size += 1;
             }
+            total_samples_clone.store(
+                total_samples_clone.load(Ordering::SeqCst) + chunk_size as u64,
+                Ordering::SeqCst,
+            );
 
             if let vosk::DecodingState::Finalized = recognizer.accept_waveform(&buffer) {
                 process_result(recognizer.result());
