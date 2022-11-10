@@ -12,9 +12,7 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use audiobook_chapterizer::{
-    format_duration, get_chapter_start, gimme_audio, serialize_alternative,
-};
+use audiobook_chapterizer::{format_duration, get_chapter_start, gimme_audio, parse_chapter};
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
     ArgAction, Parser,
@@ -60,6 +58,9 @@ struct Cli {
     /// The path to the audio file to chapterize.
     #[clap(value_name = "audio_file", short = 'i')]
     audio_file_path: PathBuf,
+    /// The path that the output .cue file will be written to.
+    #[clap(value_name = "cue_file")]
+    cue_file_path: PathBuf,
 }
 
 fn main() -> Result<(), eyre::Error> {
@@ -93,41 +94,55 @@ fn main() -> Result<(), eyre::Error> {
 
     let start_time = Instant::now();
 
-    let (rw_tx, rw_rx) = channel::unbounded::<String>();
-    let mut file = match cli.matches_file_path {
+    let (result_processor_tx, result_processor_rx) = channel::unbounded::<String>();
+    let mut matches_file = match cli.matches_file_path {
         Some(matches_file_path) => {
-            Some(File::create(matches_file_path).wrap_err("Failed to create output file")?)
+            Some(File::create(matches_file_path).wrap_err("Failed to create matches file")?)
         }
         None => None,
     };
-    let result_writer_handle = thread::spawn(move || {
-        while let Ok(msg) = rw_rx.recv() {
-            match &mut file {
-                Some(file) => {
-                    log::debug!("Writing {} bytes to output file", msg.len());
-                    file.write_all((format!("{}\n", msg)).as_bytes())
-                        .expect("Failed to write buffer to output file");
+    let mut cue_file = File::create(cli.cue_file_path).wrap_err("Failed to create cue file")?;
+    let result_processor_handle = thread::spawn(move || {
+        while let Ok(msg) = result_processor_rx.recv() {
+            let multi = serde_json::from_str(&msg).unwrap();
+            if let Some(alt) = get_chapter_start(&multi) {
+                match &mut matches_file {
+                    Some(matches_file) => {
+                        let alt_json = serde_json::to_string_pretty(&alt).unwrap();
+                        log::debug!("Writing {} bytes to matches file", alt_json.len());
+                        matches_file
+                            .write_all((format!("{}\n", alt_json)).as_bytes())
+                            .expect("Failed to write buffer to matches file");
+                    }
+                    None => {
+                        log::debug!("No matches file specified, skipped writing match");
+                    }
                 }
-                None => {
-                    log::debug!(
-                        "No matches file specified, skipped writing {} bytes",
-                        msg.len()
-                    );
-                }
+
+                let chapter_words = parse_chapter(alt);
+                log::info!(
+                    "Found chapter: {} at {}",
+                    chapter_words.iter().map(|w| w.word()).join(" "),
+                    format_duration(&Some(Duration::from_secs_f32(
+                        chapter_words.get(0).unwrap().start()
+                    )))
+                )
             }
         }
+
+        // TODO: write CUE when done
     });
 
     let total_samples = Arc::new(AtomicU64::new(0));
 
-    let (pp_stop_tx, pp_stop_rx) = channel::unbounded::<()>();
+    let (progress_reporter_stop_tx, progress_reporter_stop_rx) = channel::unbounded::<()>();
     let total_samples_clone = total_samples.clone();
-    let progress_printer_handle = thread::spawn(move || {
+    let progress_reporter_handle = thread::spawn(move || {
         let mut last_time = Instant::now();
         let mut last_samples = 0u64;
         loop {
             // Wait at most PROGRESS_INTERVAL for a stop message
-            match pp_stop_rx.recv_timeout(PROGRESS_INTERVAL) {
+            match progress_reporter_stop_rx.recv_timeout(PROGRESS_INTERVAL) {
                 Ok(_) => break,
                 Err(err) if matches!(err, channel::RecvTimeoutError::Disconnected) => break,
                 _ => (),
@@ -170,9 +185,10 @@ fn main() -> Result<(), eyre::Error> {
     let asr_handle = thread::spawn(move || {
         let process_result = |result: CompleteResult| {
             let multi = result.multiple().unwrap();
-            if let Some(alt) = get_chapter_start(&multi) {
-                rw_tx.send(serialize_alternative(alt)).unwrap();
-            }
+            // The prediction result contains borrowed data which depends on the recognizer.
+            // We serialize the data before passing it between threads to work around this.
+            let msg = serde_json::to_string(&multi).unwrap();
+            result_processor_tx.send(msg).unwrap();
         };
 
         let mut buffer: ArrayVec<i16, SAMPLES_BUFFER_SIZE> = ArrayVec::new();
@@ -195,12 +211,12 @@ fn main() -> Result<(), eyre::Error> {
             buffer.clear();
         }
         process_result(recognizer.final_result());
-        pp_stop_tx.send(()).unwrap();
+        progress_reporter_stop_tx.send(()).unwrap();
     });
 
     asr_handle.join().unwrap();
-    result_writer_handle.join().unwrap();
-    progress_printer_handle.join().unwrap();
+    result_processor_handle.join().unwrap();
+    progress_reporter_handle.join().unwrap();
 
     let end_time = Instant::now();
     let secs_processed = calc_progress_in_secs(total_samples.load(Ordering::SeqCst));
