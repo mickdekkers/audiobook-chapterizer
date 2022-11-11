@@ -14,6 +14,7 @@ use std::{
 use arrayvec::ArrayVec;
 use audiobook_chapterizer::{
     duration_to_cue_index, format_duration, get_chapter_start, gimme_audio, parse_chapter,
+    FixedVecDeque,
 };
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
@@ -23,9 +24,13 @@ use color_eyre::eyre::{self, Context, ContextCompat};
 use itertools::Itertools;
 use log::LevelFilter;
 use std::io::Write;
-use vosk::{CompleteResult, Model, Recognizer};
+use vosk::{CompleteResult, CompleteResultMultiple, Model, Recognizer};
 
 const SAMPLES_BUFFER_SIZE: usize = 8 * 1024; // 8 kb
+
+/// The number of results before and after a potential match to include as context when writing
+/// potential matches to file.
+const WRITE_POT_MATCH_CONTEXT: usize = 2;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -122,23 +127,47 @@ fn main() -> Result<(), eyre::Error> {
             .write_all((format!("{}\n", cue_header)).as_bytes())
             .expect("Failed to header to cue file");
 
-        let mut cue_track_num = 1usize;
-        while let Ok(msg) = result_processor_rx.recv() {
-            let multi = serde_json::from_str(&msg).unwrap();
-            if let Some(alt) = get_chapter_start(&multi) {
-                match &mut matches_file {
-                    Some(matches_file) => {
-                        let alt_json = serde_json::to_string_pretty(&alt).unwrap();
-                        log::debug!("Writing {} bytes to matches file", alt_json.len());
-                        matches_file
-                            .write_all((format!("{}\n", alt_json)).as_bytes())
-                            .expect("Failed to write buffer to matches file");
-                    }
-                    None => {
-                        log::debug!("No matches file specified, skipped writing match");
-                    }
-                }
+        let mut write_json_to_matches_file = |json: &str| match &mut matches_file {
+            Some(matches_file) => {
+                log::debug!("Writing {} bytes to matches file", json.len());
+                matches_file
+                    .write_all((format!("{}\n", json)).as_bytes())
+                    .expect("Failed to write buffer to matches file");
+            }
+            None => {
+                log::debug!("No matches file specified, skipped writing");
+            }
+        };
 
+        let mut cue_track_num = 1usize;
+        let mut result_index = 0u64;
+        let mut previous_results: FixedVecDeque<String> =
+            FixedVecDeque::with_max_len(WRITE_POT_MATCH_CONTEXT);
+        let mut last_potential_match_index: Option<u64> = None;
+        while let Ok(msg) = result_processor_rx.recv() {
+            let multi: CompleteResultMultiple = serde_json::from_str(&msg).unwrap();
+
+            if multi
+                .alternatives
+                .iter()
+                .any(|alt| alt.result.iter().any(|r| r.word == "chapter"))
+            {
+                // Write previous N results as context
+                for prev_result in previous_results.iter().take(WRITE_POT_MATCH_CONTEXT) {
+                    write_json_to_matches_file(prev_result);
+                }
+                // Write potential match result
+                write_json_to_matches_file(&msg);
+
+                last_potential_match_index.replace(result_index);
+            } else if let Some(lpmi) = last_potential_match_index {
+                // Write next N results following a potential match as context
+                if (result_index - lpmi) <= WRITE_POT_MATCH_CONTEXT as u64 {
+                    write_json_to_matches_file(&msg);
+                }
+            }
+
+            if let Some(alt) = get_chapter_start(&multi) {
                 let chapter_words = parse_chapter(alt);
                 let chapter_title = chapter_words.iter().map(|w| w.word()).join(" ");
                 let chapter_start_duration =
@@ -169,6 +198,9 @@ fn main() -> Result<(), eyre::Error> {
 
                 cue_track_num += 1;
             }
+
+            result_index += 1;
+            previous_results.push_back(msg);
         }
     });
 
