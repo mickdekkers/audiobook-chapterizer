@@ -12,7 +12,9 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use audiobook_chapterizer::{format_duration, get_chapter_start, gimme_audio, parse_chapter};
+use audiobook_chapterizer::{
+    duration_to_cue_index, format_duration, get_chapter_start, gimme_audio, parse_chapter,
+};
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
     ArgAction, Parser,
@@ -26,6 +28,9 @@ use vosk::{CompleteResult, Model, Recognizer};
 const SAMPLES_BUFFER_SIZE: usize = 8 * 1024; // 8 kb
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// This margin is subtracted from the start timestamp of a chapter when output.
+const PRE_CHAPTER_START_MARGIN: Duration = Duration::from_secs(1);
 
 // TODO: find a way to parallelize the workload
 
@@ -101,8 +106,23 @@ fn main() -> Result<(), eyre::Error> {
         }
         None => None,
     };
+    // TODO: double check encoding, is it ASCII or is UTF8 ok?
     let mut cue_file = File::create(cli.cue_file_path).wrap_err("Failed to create cue file")?;
     let result_processor_handle = thread::spawn(move || {
+        // TODO: use correct file type in cue
+        let cue_header = &format!(
+            "FILE \"{}\" MP4",
+            &cli.audio_file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('\"', ""),
+        );
+        cue_file
+            .write_all((format!("{}\n", cue_header)).as_bytes())
+            .expect("Failed to header to cue file");
+
+        let mut cue_track_num = 1usize;
         while let Ok(msg) = result_processor_rx.recv() {
             let multi = serde_json::from_str(&msg).unwrap();
             if let Some(alt) = get_chapter_start(&multi) {
@@ -120,17 +140,36 @@ fn main() -> Result<(), eyre::Error> {
                 }
 
                 let chapter_words = parse_chapter(alt);
+                let chapter_title = chapter_words.iter().map(|w| w.word()).join(" ");
+                let chapter_start_duration =
+                    Duration::from_secs_f32(chapter_words.get(0).unwrap().start());
+
                 log::info!(
                     "Found chapter: {} at {}",
-                    chapter_words.iter().map(|w| w.word()).join(" "),
-                    format_duration(&Some(Duration::from_secs_f32(
-                        chapter_words.get(0).unwrap().start()
-                    )))
-                )
+                    chapter_title,
+                    format_duration(&Some(chapter_start_duration))
+                );
+
+                let cue_track = unindent::unindent(&format!(
+                    "
+                        TRACK {} AUDIO
+                          TITLE \"Chapter {:02}\"
+                          INDEX 01 {}
+                    ",
+                    cue_track_num,
+                    chapter_words.get(1).unwrap().word().parse::<f32>().unwrap(),
+                    duration_to_cue_index(
+                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN))
+                    ),
+                ));
+
+                cue_file
+                    .write_all(cue_track.as_bytes())
+                    .expect("Failed to write track to cue file");
+
+                cue_track_num += 1;
             }
         }
-
-        // TODO: write CUE when done
     });
 
     let total_samples = Arc::new(AtomicU64::new(0));
