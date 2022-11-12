@@ -301,8 +301,9 @@ impl ResultsParser {
         }
     }
 
-    /// Flushes the ResultsParser. Attempts to parse the remaining contents of the buffer.
-    pub fn flush(&mut self) {
+    /// Consumes and flushes the ResultsParser. Attempts to parse the remaining contents of the
+    /// buffer before dropping.
+    pub fn flush(mut self) {
         self.do_parse(true);
     }
 
