@@ -1,5 +1,6 @@
 use crossbeam::channel;
 use std::{
+    cell::RefCell,
     ffi::{OsStr, OsString},
     fs::File,
     path::PathBuf,
@@ -13,15 +14,15 @@ use std::{
 
 use arrayvec::ArrayVec;
 use audiobook_chapterizer::{
-    duration_to_cue_index, format_duration, get_chapter_start, gimme_audio, parse_chapter,
-    FixedVecDeque,
+    alt_contains_potential_match, duration_to_cue_index, format_duration, get_best_alt,
+    gimme_audio, parse_chapter, FixedVecDeque, MatchBuffer, OwnedWord,
 };
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
     ArgAction, Parser,
 };
 use color_eyre::eyre::{self, Context, ContextCompat};
-use itertools::Itertools;
+use itertools::{put_back, Itertools};
 use log::LevelFilter;
 use std::io::Write;
 use vosk::{CompleteResult, CompleteResultMultiple, Model, Recognizer};
@@ -32,14 +33,15 @@ const SAMPLES_BUFFER_SIZE: usize = 8 * 1024; // 8 kb
 /// potential matches to file.
 const WRITE_POT_MATCH_CONTEXT: usize = 2;
 
+/// 30 tokens should be plenty to capture the chapter number followed by most chapter titles
+const POST_CHAPTER_CONTEXT: usize = 30;
+
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// This margin is subtracted from the start timestamp of a chapter when output.
 const PRE_CHAPTER_START_MARGIN: Duration = Duration::from_secs(1);
 
 // TODO: find a way to parallelize the workload
-
-// TODO: create function that returns iterator of recognition results
 
 fn verify_jsonl_ext(os: OsString) -> Result<PathBuf, &'static str> {
     let path = PathBuf::from(os);
@@ -143,15 +145,59 @@ fn main() -> Result<(), eyre::Error> {
         let mut result_index = 0u64;
         let mut previous_results: FixedVecDeque<String> =
             FixedVecDeque::with_max_len(WRITE_POT_MATCH_CONTEXT);
+        let mut last_word_of_previous_result: Option<OwnedWord> = None;
+        let match_buffer: RefCell<MatchBuffer> =
+            RefCell::new(MatchBuffer::new(POST_CHAPTER_CONTEXT));
         let mut last_potential_match_index: Option<u64> = None;
+        let parsed_chapters_buffer: RefCell<Vec<Vec<OwnedWord>>> = RefCell::new(Vec::new());
+
+        let mut flush_parsed_chapters = || {
+            for parsed_chapter in parsed_chapters_buffer.borrow_mut().drain(..) {
+                let chapter_title = parsed_chapter.iter().map(|w| w.word.to_string()).join(" ");
+                let chapter_start_duration =
+                    Duration::from_secs_f32(parsed_chapter.get(0).unwrap().start);
+
+                log::info!(
+                    "Found chapter: {} at {}",
+                    chapter_title,
+                    format_duration(&Some(chapter_start_duration))
+                );
+
+                let cue_track = unindent::unindent(&format!(
+                    "
+                        TRACK {} AUDIO
+                          TITLE \"Chapter {:02}\"
+                          INDEX 01 {}
+                    ",
+                    cue_track_num,
+                    parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap(),
+                    duration_to_cue_index(
+                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN))
+                    ),
+                ));
+
+                cue_file
+                    .write_all(cue_track.as_bytes())
+                    .expect("Failed to write track to cue file");
+
+                cue_track_num += 1;
+            }
+        };
+
+        let flush_match_buffer = || {
+            if match_buffer.borrow().has_data() {
+                // Process the data in the buffer
+                if let Some(parsed_chapter) = parse_chapter(&match_buffer.borrow()) {
+                    parsed_chapters_buffer.borrow_mut().push(parsed_chapter);
+                }
+            }
+            match_buffer.borrow_mut().clear();
+        };
+
         while let Ok(msg) = result_processor_rx.recv() {
             let multi: CompleteResultMultiple = serde_json::from_str(&msg).unwrap();
 
-            if multi
-                .alternatives
-                .iter()
-                .any(|alt| alt.result.iter().any(|r| r.word == "chapter"))
-            {
+            if multi.alternatives.iter().any(alt_contains_potential_match) {
                 // Write previous N results as context
                 for prev_result in previous_results.iter().take(WRITE_POT_MATCH_CONTEXT) {
                     write_json_to_matches_file(prev_result);
@@ -167,41 +213,52 @@ fn main() -> Result<(), eyre::Error> {
                 }
             }
 
-            if let Some(alt) = get_chapter_start(&multi) {
-                let chapter_words = parse_chapter(alt);
-                let chapter_title = chapter_words.iter().map(|w| w.word()).join(" ");
-                let chapter_start_duration =
-                    Duration::from_secs_f32(chapter_words.get(0).unwrap().start());
+            let best_alt = get_best_alt(&multi.alternatives);
 
-                log::info!(
-                    "Found chapter: {} at {}",
-                    chapter_title,
-                    format_duration(&Some(chapter_start_duration))
-                );
+            let mut prev_token = last_word_of_previous_result.clone();
+            let mut token_iter = put_back(best_alt.result.iter().map(OwnedWord::from));
+            while let Some(token) = token_iter.next() {
+                if match_buffer.borrow().has_data() || token.is_chapter_token() {
+                    // If this is a new match, set MatchBuffer's token before match
+                    if match_buffer.borrow().is_empty() && token.is_chapter_token() {
+                        // MatchBuffer's token before match should have been cleared at this point
+                        assert!(match_buffer.borrow().token_before_match.is_none());
 
-                let cue_track = unindent::unindent(&format!(
-                    "
-                        TRACK {} AUDIO
-                          TITLE \"Chapter {:02}\"
-                          INDEX 01 {}
-                    ",
-                    cue_track_num,
-                    chapter_words.get(1).unwrap().word().parse::<f32>().unwrap(),
-                    duration_to_cue_index(
-                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN))
-                    ),
-                ));
+                        if let Some(last_token) = prev_token.as_ref() {
+                            match_buffer
+                                .borrow_mut()
+                                .set_token_before_match(last_token.clone());
+                        }
+                    }
 
-                cue_file
-                    .write_all(cue_track.as_bytes())
-                    .expect("Failed to write track to cue file");
-
-                cue_track_num += 1;
+                    // Note: we intentionally do not borrow_mut in the if let scrutinee, because
+                    // that results in the mutable borrow being held _through the entire if let_.
+                    // Doing so results in a panic when flush_match_buffer attempts to borrow the
+                    // match_buffer again. We should see about getting a clippy lint for this...
+                    // See https://doc.rust-lang.org/reference/destructors.html#temporary-scopes
+                    let insert_result = match_buffer.borrow_mut().try_insert(token.clone());
+                    if let Some(failed_insert) = insert_result {
+                        // Flush match buffer when full
+                        flush_match_buffer();
+                        // Put item back for processing in next iteration
+                        token_iter.put_back(failed_insert);
+                    } else {
+                        prev_token.replace(token);
+                    }
+                } else {
+                    prev_token.replace(token);
+                }
             }
 
-            result_index += 1;
+            flush_parsed_chapters();
+
+            last_word_of_previous_result.replace(prev_token.unwrap());
             previous_results.push_back(msg);
+            result_index += 1;
         }
+
+        flush_match_buffer();
+        flush_parsed_chapters();
     });
 
     let total_samples = Arc::new(AtomicU64::new(0));
