@@ -2,6 +2,7 @@ use std::{collections::VecDeque, path::Path, time::Duration};
 
 use audio_provider::AudioProvider;
 use color_eyre::eyre::{self, Context};
+use crossbeam::channel;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use ordered_float::NotNan;
@@ -10,7 +11,7 @@ use text2num::{
     word_to_digit::{find_numbers_iter, Replace},
     Language, Token,
 };
-use vosk::{Alternative, WordInAlternative};
+use vosk::{Alternative, CompleteResultMultiple, WordInAlternative};
 
 mod audio_provider;
 
@@ -91,7 +92,7 @@ impl<'a> From<&'a WordInAlternative<'a>> for OwnedWord {
     }
 }
 
-// TODO: parse number homophones
+// TODO: parse number homophones (but log when doing this too)
 impl Token for &'_ OwnedWord {
     fn text(&self) -> &str {
         &self.word
@@ -126,52 +127,6 @@ impl Replace for OwnedWord {
 }
 
 const MIN_VOCAL_PAUSE_BEFORE_CHAPTER: f32 = 0.25;
-
-pub fn parse_chapter(match_buffer: &MatchBuffer) -> Option<Vec<OwnedWord>> {
-    log::debug!("Parsing chapter with match buffer:\n{:#?}", match_buffer);
-    let mut token_iter = match_buffer.iter().cloned().peekable();
-    let match_token = token_iter.peek().unwrap();
-    assert!(match_token.is_chapter_token());
-
-    if let Some(prev_token) = match_buffer.token_before_match.as_ref() {
-        let vocal_pause_len = match_token.start - prev_token.end;
-        if vocal_pause_len < MIN_VOCAL_PAUSE_BEFORE_CHAPTER {
-            log::debug!(
-                "Rejecting match: vocal pause before chapter not long enough at {:.3}s",
-                vocal_pause_len
-            );
-            return None;
-        }
-    }
-
-    let tokens = token_iter.collect::<Vec<_>>();
-
-    // Sanity check
-    for token in &tokens {
-        assert!(!token.is_replacement);
-    }
-
-    let mut tokens = rewrite_numbers(tokens, &*LANG_EN, 0.0);
-
-    tokens.drain(match tokens.get(1) {
-        // Keep the first two words if the second word is a number
-        Some(second_token) if second_token.is_replacement => 2..,
-        // Otherwise, this is not a valid chapter
-        Some(second_token) => {
-            log::debug!(
-                "Rejecting match: token after chapter is not a number: {:#?}",
-                second_token
-            );
-            return None;
-        }
-        None => {
-            log::debug!("Rejecting match: no token after chapter");
-            return None;
-        }
-    });
-
-    Some(tokens)
-}
 
 // TODO: refactor/deduplicate this
 pub fn is_chapter_token<'a>(wia: &'a WordInAlternative<'a>) -> bool {
@@ -232,6 +187,7 @@ pub fn get_best_alt<'a>(alts: &'a [Alternative<'a>]) -> &'a Alternative<'a> {
             }
         }
 
+        // TODO: log how score was determined
         NotNan::new(score).unwrap()
     };
 
@@ -281,59 +237,193 @@ impl<T> std::ops::DerefMut for FixedVecDeque<T> {
 }
 
 #[derive(Debug)]
-pub struct MatchBuffer {
-    pub token_before_match: Option<OwnedWord>,
-    inner: Vec<OwnedWord>,
+pub enum ParseResult {
+    Match(Vec<OwnedWord>),
+    Incomplete,
+    Failure,
+}
+
+#[derive(Debug)]
+pub struct ResultsParser {
+    parse_result_tx: channel::Sender<ParseResult>,
+    buffer: Vec<OwnedWord>,
     capacity: usize,
 }
 
-impl MatchBuffer {
-    pub fn new(post_match_context: usize) -> Self {
-        let capacity = 1 + post_match_context;
-        Self {
-            token_before_match: None,
-            inner: Vec::with_capacity(capacity),
-            capacity,
-        }
-    }
+impl ResultsParser {
+    pub fn new(post_match_context: usize) -> (Self, channel::Receiver<ParseResult>) {
+        let (tx, rx) = channel::unbounded();
+        let capacity = 2 + post_match_context;
 
-    pub fn clear(&mut self) {
-        self.inner.clear();
-        self.token_before_match.take();
+        (
+            Self {
+                buffer: Vec::with_capacity(capacity),
+                capacity,
+                parse_result_tx: tx,
+            },
+            rx,
+        )
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.buffer.is_empty()
     }
 
     pub fn has_data(&self) -> bool {
         !self.is_empty()
     }
 
-    pub fn is_full(&self) -> bool {
-        self.inner.len() == self.capacity
+    fn is_full(&self) -> bool {
+        self.buffer.len() == self.capacity
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &OwnedWord> + '_ {
-        self.inner.iter()
-    }
+    /// Ingests a batch of prediction results. Keeps the prev_token Option up to date with to the
+    /// last token in the batch.
+    pub fn ingest_results(
+        &mut self,
+        prev_token: &mut Option<OwnedWord>,
+        multi: &CompleteResultMultiple,
+    ) {
+        let best_alt = get_best_alt(&multi.alternatives);
+        let alt_token_iter = best_alt.result.iter();
+        for token in alt_token_iter.map(OwnedWord::from) {
+            if self.has_data() || token.is_chapter_token() {
+                // If this is a new match, first push the token before the chapter token
+                if self.is_empty() && token.is_chapter_token() {
+                    if let Some(ref prev_token) = prev_token {
+                        self.push(prev_token.clone());
+                    }
+                }
 
-    pub fn set_token_before_match(&mut self, token: OwnedWord) {
-        self.token_before_match.replace(token);
-    }
-
-    /// Tries to insert the item into the buffer. If the buffer is full, the item is not inserted
-    /// and returned as Some(item)
-    #[must_use]
-    pub fn try_insert(&mut self, item: OwnedWord) -> Option<OwnedWord> {
-        if self.is_full() {
-            Some(item)
-        } else {
-            if self.is_empty() {
-                assert!(item.is_chapter_token());
+                self.push(token.clone());
             }
-            self.inner.push(item);
-            None
+            prev_token.replace(token);
         }
+    }
+
+    /// Flushes the ResultsParser. Attempts to parse the remaining contents of the buffer.
+    pub fn flush(&mut self) {
+        self.do_parse(true);
+    }
+
+    /// Pushes the item into the ResultsParser.
+    fn push(&mut self, item: OwnedWord) {
+        self.buffer.push(item);
+        assert!(self.buffer.len() <= self.capacity);
+        self.do_parse(false);
+    }
+
+    fn do_parse(&mut self, is_end: bool) {
+        let parse_result = self.parse_chapter(is_end);
+
+        if is_end {
+            // If this is the end, parse_chapter should not return Incomplete
+            assert!(!matches!(parse_result, ParseResult::Incomplete));
+        }
+
+        match parse_result {
+            ParseResult::Match(_) | ParseResult::Failure => {
+                self.buffer.clear();
+            }
+            ParseResult::Incomplete => {
+                if self.is_full() {
+                    log::warn!(
+                        "parse_chapter returned ParseResult::Incomplete despite buffer being full!"
+                    );
+                    self.buffer.clear();
+                }
+            }
+        }
+
+        // Don't send Incomplete results
+        if !matches!(parse_result, ParseResult::Incomplete) {
+            self.parse_result_tx.send(parse_result).unwrap();
+        }
+    }
+
+    fn parse_chapter(&self, is_end: bool) -> ParseResult {
+        log::debug!("Parsing chapter with match buffer:\n{:#?}", self);
+
+        let (chapter_token_index, chapter_token) =
+            match self.buffer.iter().find_position(|t| t.is_chapter_token()) {
+                Some(tuple) => tuple,
+                None => {
+                    return if is_end {
+                        log::debug!("ParseResult::Failure: no chapter token");
+                        ParseResult::Failure
+                    } else {
+                        log::debug!("ParseResult::Incomplete: waiting for chapter token");
+                        ParseResult::Incomplete
+                    }
+                }
+            };
+
+        if let Some(prev_token) = chapter_token_index
+            .checked_sub(1)
+            .and_then(|index| self.buffer.get(index))
+        {
+            let vocal_pause_len = chapter_token.start - prev_token.end;
+            if vocal_pause_len < MIN_VOCAL_PAUSE_BEFORE_CHAPTER {
+                log::debug!(
+                    "ParseResult::Failure: vocal pause before chapter token not long enough at {:.3}s",
+                    vocal_pause_len
+                );
+                return ParseResult::Failure;
+            }
+        }
+
+        if self.buffer.iter().skip(chapter_token_index + 1).count() == 0 {
+            return if is_end {
+                log::debug!("ParseResult::Failure: no token after chapter");
+                ParseResult::Failure
+            } else {
+                log::debug!("ParseResult::Incomplete: waiting for token after chapter token");
+                ParseResult::Incomplete
+            };
+        }
+
+        let tokens = self
+            .buffer
+            .iter()
+            .skip(chapter_token_index)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Sanity check
+        for token in &tokens {
+            assert!(!token.is_replacement);
+        }
+
+        let mut tokens = rewrite_numbers(tokens, &*LANG_EN, 0.0);
+
+        let chapter_token = tokens.get(0).unwrap();
+
+        // Sanity check
+        assert!(chapter_token.is_chapter_token());
+        assert!(!chapter_token.is_replacement);
+
+        let chapter_number_token = tokens.get(1).unwrap();
+        if !chapter_number_token.is_replacement {
+            log::debug!(
+                "ParseResult::Failure: token after chapter is not a number: {:#?}",
+                chapter_number_token
+            );
+            return ParseResult::Failure;
+        }
+
+        let token_after_chapter_number = tokens.get(2);
+        if token_after_chapter_number.is_none() && !is_end {
+            // We can't yet be certain that this is the end of the number string
+            log::debug!("ParseResult::Incomplete: waiting for token after chapter number token");
+            return ParseResult::Incomplete;
+        }
+
+        // TODO: attempt to extract chapter title using vocal pause
+
+        tokens.drain(2..);
+
+        let parse_result = ParseResult::Match(tokens);
+        log::debug!("ParseResult::Match: {:#?}", parse_result);
+        parse_result
     }
 }

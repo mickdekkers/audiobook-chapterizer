@@ -1,6 +1,5 @@
 use crossbeam::channel;
 use std::{
-    cell::RefCell,
     ffi::{OsStr, OsString},
     fs::File,
     path::PathBuf,
@@ -14,15 +13,15 @@ use std::{
 
 use arrayvec::ArrayVec;
 use audiobook_chapterizer::{
-    alt_contains_potential_match, duration_to_cue_index, format_duration, get_best_alt,
-    gimme_audio, parse_chapter, FixedVecDeque, MatchBuffer, OwnedWord,
+    alt_contains_potential_match, duration_to_cue_index, format_duration, gimme_audio,
+    FixedVecDeque, OwnedWord, ParseResult, ResultsParser,
 };
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
     ArgAction, Parser,
 };
 use color_eyre::eyre::{self, Context, ContextCompat};
-use itertools::{put_back, Itertools};
+use itertools::Itertools;
 use log::LevelFilter;
 use std::io::Write;
 use vosk::{CompleteResult, CompleteResultMultiple, Model, Recognizer};
@@ -116,19 +115,6 @@ fn main() -> Result<(), eyre::Error> {
     // TODO: double check encoding, is it ASCII or is UTF8 ok?
     let mut cue_file = File::create(cli.cue_file_path).wrap_err("Failed to create cue file")?;
     let result_processor_handle = thread::spawn(move || {
-        // TODO: use correct file type in cue
-        let cue_header = &format!(
-            "FILE \"{}\" MP4",
-            &cli.audio_file_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replace('\"', ""),
-        );
-        cue_file
-            .write_all((format!("{}\n", cue_header)).as_bytes())
-            .expect("Failed to header to cue file");
-
         let mut write_json_to_matches_file = |json: &str| match &mut matches_file {
             Some(matches_file) => {
                 log::debug!("Writing {} bytes to matches file", json.len());
@@ -141,18 +127,34 @@ fn main() -> Result<(), eyre::Error> {
             }
         };
 
-        let mut cue_track_num = 1usize;
-        let mut result_index = 0u64;
-        let mut previous_results: FixedVecDeque<String> =
-            FixedVecDeque::with_max_len(WRITE_POT_MATCH_CONTEXT);
-        let mut last_word_of_previous_result: Option<OwnedWord> = None;
-        let match_buffer: RefCell<MatchBuffer> =
-            RefCell::new(MatchBuffer::new(POST_CHAPTER_CONTEXT));
-        let mut last_potential_match_index: Option<u64> = None;
-        let parsed_chapters_buffer: RefCell<Vec<Vec<OwnedWord>>> = RefCell::new(Vec::new());
+        let (mut results_parser, parse_result_rx) = ResultsParser::new(POST_CHAPTER_CONTEXT);
 
-        let mut flush_parsed_chapters = || {
-            for parsed_chapter in parsed_chapters_buffer.borrow_mut().drain(..) {
+        let mut cue_track_num = 1usize;
+        let parse_result_processor_handle = thread::spawn(move || {
+            // TODO: use correct file type in cue
+            let cue_header = &format!(
+                "FILE \"{}\" MP4",
+                &cli.audio_file_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\"', ""),
+            );
+
+            cue_file
+                .write_all((format!("{}\n", cue_header)).as_bytes())
+                .expect("Failed to header to cue file");
+
+            while let Ok(parse_result) = parse_result_rx.recv() {
+                // TODO: filter out duplicate chapters
+                let parsed_chapter = match parse_result {
+                    ParseResult::Match(parsed_chapter) => parsed_chapter,
+                    ParseResult::Failure => continue,
+                    ParseResult::Incomplete => {
+                        unreachable!("Incomplete results should never be sent")
+                    }
+                };
+
                 let chapter_title = parsed_chapter.iter().map(|w| w.word.to_string()).join(" ");
                 let chapter_start_duration =
                     Duration::from_secs_f32(parsed_chapter.get(0).unwrap().start);
@@ -182,18 +184,14 @@ fn main() -> Result<(), eyre::Error> {
 
                 cue_track_num += 1;
             }
-        };
+        });
 
-        let flush_match_buffer = || {
-            if match_buffer.borrow().has_data() {
-                // Process the data in the buffer
-                if let Some(parsed_chapter) = parse_chapter(&match_buffer.borrow()) {
-                    parsed_chapters_buffer.borrow_mut().push(parsed_chapter);
-                }
-            }
-            match_buffer.borrow_mut().clear();
-        };
+        let mut result_index = 0u64;
+        let mut previous_results: FixedVecDeque<String> =
+            FixedVecDeque::with_max_len(WRITE_POT_MATCH_CONTEXT);
+        let mut last_potential_match_index: Option<u64> = None;
 
+        let mut last_token: Option<OwnedWord> = None;
         while let Ok(msg) = result_processor_rx.recv() {
             let multi: CompleteResultMultiple = serde_json::from_str(&msg).unwrap();
 
@@ -213,52 +211,14 @@ fn main() -> Result<(), eyre::Error> {
                 }
             }
 
-            let best_alt = get_best_alt(&multi.alternatives);
+            results_parser.ingest_results(&mut last_token, &multi);
 
-            let mut prev_token = last_word_of_previous_result.clone();
-            let mut token_iter = put_back(best_alt.result.iter().map(OwnedWord::from));
-            while let Some(token) = token_iter.next() {
-                if match_buffer.borrow().has_data() || token.is_chapter_token() {
-                    // If this is a new match, set MatchBuffer's token before match
-                    if match_buffer.borrow().is_empty() && token.is_chapter_token() {
-                        // MatchBuffer's token before match should have been cleared at this point
-                        assert!(match_buffer.borrow().token_before_match.is_none());
-
-                        if let Some(last_token) = prev_token.as_ref() {
-                            match_buffer
-                                .borrow_mut()
-                                .set_token_before_match(last_token.clone());
-                        }
-                    }
-
-                    // Note: we intentionally do not borrow_mut in the if let scrutinee, because
-                    // that results in the mutable borrow being held _through the entire if let_.
-                    // Doing so results in a panic when flush_match_buffer attempts to borrow the
-                    // match_buffer again. We should see about getting a clippy lint for this...
-                    // See https://doc.rust-lang.org/reference/destructors.html#temporary-scopes
-                    let insert_result = match_buffer.borrow_mut().try_insert(token.clone());
-                    if let Some(failed_insert) = insert_result {
-                        // Flush match buffer when full
-                        flush_match_buffer();
-                        // Put item back for processing in next iteration
-                        token_iter.put_back(failed_insert);
-                    } else {
-                        prev_token.replace(token);
-                    }
-                } else {
-                    prev_token.replace(token);
-                }
-            }
-
-            flush_parsed_chapters();
-
-            last_word_of_previous_result.replace(prev_token.unwrap());
             previous_results.push_back(msg);
             result_index += 1;
         }
 
-        flush_match_buffer();
-        flush_parsed_chapters();
+        results_parser.flush();
+        parse_result_processor_handle.join().unwrap();
     });
 
     let total_samples = Arc::new(AtomicU64::new(0));
