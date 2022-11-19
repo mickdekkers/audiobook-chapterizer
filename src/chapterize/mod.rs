@@ -6,7 +6,7 @@ use crate::{
         results_parser::{alt_contains_potential_match, ParseResult, ResultsParser},
         token::Token,
     },
-    cue::duration_to_cue_index,
+    cue::CueWriter,
     fixed_vec_deque::FixedVecDeque,
     format_duration,
 };
@@ -96,9 +96,8 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
         None => None,
     };
     let audio_file_path = options.audio_file_path.clone();
-    // TODO: double check encoding, is it ASCII or is UTF8 ok?
-    let mut cue_file =
-        File::create(&options.cue_file_path).wrap_err("Failed to create cue file")?;
+
+    let cue_file = File::create(&options.cue_file_path).wrap_err("Failed to create cue file")?;
     let result_processor_handle = thread::spawn(move || {
         let mut write_json_to_matches_file = |json: &str| match &mut matches_file {
             Some(matches_file) => {
@@ -114,22 +113,11 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
         let (mut results_parser, parse_result_rx) = ResultsParser::new(POST_CHAPTER_CONTEXT);
 
-        let mut cue_track_num = 1usize;
+        // TODO: refactor parse result processing into trait + struct impl for .cue
         let parse_result_processor_handle = thread::spawn(move || {
-            // TODO: refactor parse result processing into trait + struct impl for .cue
-            // TODO: use correct file type in cue
-            let cue_header = &format!(
-                "FILE \"{}\" MP4",
-                &audio_file_path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\"', ""),
-            );
+            let mut cue_writer = CueWriter::new(Box::new(cue_file));
 
-            cue_file
-                .write_all((format!("{}\n", cue_header)).as_bytes())
-                .expect("Failed to write header to cue file");
+            cue_writer.write_header(&audio_file_path).unwrap();
 
             while let Ok(parse_result) = parse_result_rx.recv() {
                 // TODO: filter out duplicate chapters
@@ -151,24 +139,15 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
                     format_duration(&Some(chapter_start_duration))
                 );
 
-                let cue_track = unindent::unindent(&format!(
-                    "
-                        TRACK {} AUDIO
-                          TITLE \"Chapter {:02}\"
-                          INDEX 01 {}
-                    ",
-                    cue_track_num,
-                    parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap(),
-                    duration_to_cue_index(
-                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN))
-                    ),
-                ));
-
-                cue_file
-                    .write_all(cue_track.as_bytes())
-                    .expect("Failed to write track to cue file");
-
-                cue_track_num += 1;
+                cue_writer
+                    .write_track(
+                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN)),
+                        &format!(
+                            "Chapter {:02}",
+                            parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap()
+                        ),
+                    )
+                    .unwrap();
             }
         });
 
