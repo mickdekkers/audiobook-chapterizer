@@ -119,6 +119,10 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
             cue_writer.write_header(&audio_file_path).unwrap();
 
+            cue_writer
+                .write_track(&Duration::ZERO, "Chapter 00")
+                .unwrap();
+
             while let Ok(parse_result) = parse_result_rx.recv() {
                 // TODO: filter out duplicate chapters
                 let parsed_chapter = match parse_result {
