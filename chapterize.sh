@@ -9,6 +9,7 @@ function chapterize() {
     local out_dir
 
     input_path="$1"
+    audio_dirname="$(dirname "$input_path")"
     audio_filename="$(basename "$input_path")"
     audio_name="${audio_filename%.*}"
     out_dir="${2:-.}/${audio_name}"
@@ -24,6 +25,8 @@ function chapterize() {
         -i "$input_path" \
         "${out_dir}/${audio_name}.cue" \
         2>&1 | tee "${out_dir}/${audio_name}.log"
+
+    cp -n "${out_dir}/${audio_name}.cue" "${audio_dirname}/${audio_name}.cue"
 
     echo "Done chapterizing ${input_path}"
 }
