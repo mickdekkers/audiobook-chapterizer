@@ -40,8 +40,8 @@ const POST_CHAPTER_CONTEXT: usize = 30;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Use the average speed factor of the last 30 seconds to calculate the ETA
-const ETA_CALC_WINDOW: usize = 30 / PROGRESS_INTERVAL.as_secs() as usize;
+/// Use the average speed factor of the last 5 minutes to calculate the ETA
+const ETA_CALC_WINDOW: usize = 300 / PROGRESS_INTERVAL.as_secs() as usize;
 
 /// This margin is subtracted from the start timestamp of a chapter when output.
 const PRE_CHAPTER_START_MARGIN: Duration = Duration::from_secs(1);
