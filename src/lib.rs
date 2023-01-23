@@ -3,6 +3,7 @@ use std::time::Duration;
 pub mod audio_provider;
 pub mod chapterize;
 pub mod cue;
+pub mod extract;
 pub mod fixed_vec_deque;
 
 pub fn format_duration(duration: &Option<Duration>) -> String {
