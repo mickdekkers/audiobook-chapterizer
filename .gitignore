@@ -7,6 +7,7 @@
 *.m4a
 *.jsonl
 *.cue
+*.ffmetadata
 *.bak
 TODO.md
 *.txt

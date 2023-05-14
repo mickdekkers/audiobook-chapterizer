@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 arrayvec = "0.7.2"
 chrono = "0.4.23"
-clap = { version = "4.0.22", features = ["derive"] }
+clap = { version = "4.2.7", features = ["derive"] }
 color-eyre = "0.6.2"
 crossbeam = "0.8.2"
 env_logger = "0.9.3"

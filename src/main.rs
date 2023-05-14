@@ -1,7 +1,10 @@
-use audiobook_chapterizer::chapterize::{chapterize, ChapterizeOptions};
+use audiobook_chapterizer::{
+    chapterize::{chapterize, ChapterizeOptions},
+    extract::extract_chapters,
+};
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
-    ArgAction, Parser,
+    ArgAction, Args, Parser,
 };
 use color_eyre::eyre;
 use log::LevelFilter;
@@ -20,29 +23,39 @@ fn verify_jsonl_ext(os: OsString) -> Result<PathBuf, &'static str> {
     Ok(path)
 }
 
+#[derive(Args)]
+#[group(required = true, multiple = true)]
+struct Outputs {
+    // TODO: verify extension of .cue
+    /// The path that the output .cue file will be written to (if any).
+    #[arg(value_name = "cue_file", long = "output_cue")]
+    cue_file_path: Option<PathBuf>,
+    /// The path that the output ffmetadata file will be written to (if any).
+    #[arg(value_name = "ffmetadata_file", long = "output_ffmetadata")]
+    ffmetadata_file_path: Option<PathBuf>,
+}
+
 #[derive(Parser)]
 struct Cli {
     /// Makes logging more verbose. Pass once for debug log level, twice for trace log level.
-    #[clap(short, action = ArgAction::Count, global = true)]
+    #[arg(short, action = ArgAction::Count, global = true)]
     verbose: u8,
     /// The path to the Vosk ASR model directory to use.
-    #[clap(value_name = "model_dir", long = "model", default_value = "./model")]
+    #[arg(value_name = "model_dir", long = "model", default_value = "./model")]
     model_dir_path: PathBuf,
     /// Optionally, a path to a file to write matching recognition results to. The path must end in
     /// .jsonl
-    #[clap(
+    #[arg(
         value_name = "matches_file",
         long = "write_matches",
         value_parser = OsStringValueParser::new().try_map(verify_jsonl_ext)
     )]
     matches_file_path: Option<PathBuf>,
     /// The path to the audio file to chapterize.
-    #[clap(value_name = "audio_file", short = 'i')]
+    #[arg(value_name = "audio_file", short = 'i')]
     audio_file_path: PathBuf,
-    // TODO: verify extension of .cue
-    /// The path that the output .cue file will be written to.
-    #[clap(value_name = "cue_file")]
-    cue_file_path: PathBuf,
+    #[command(flatten)]
+    outputs: Outputs,
 }
 
 impl From<Cli> for ChapterizeOptions {
@@ -51,7 +64,8 @@ impl From<Cli> for ChapterizeOptions {
             model_dir_path: val.model_dir_path,
             matches_file_path: val.matches_file_path,
             audio_file_path: val.audio_file_path,
-            cue_file_path: val.cue_file_path,
+            cue_file_path: val.outputs.cue_file_path,
+            ffmetadata_file_path: val.outputs.ffmetadata_file_path,
         }
     }
 }
@@ -67,7 +81,15 @@ fn main() -> Result<(), eyre::Error> {
         })
         .init();
 
-    chapterize(&cli.into())?;
+    // TODO: add option/subcommand to skip metadata extraction and force ASR instead
+    // TODO: add force-extract flag and force-asr (or similar) flag
+    // let metadata_chapters_found =
+    //     extract_chapters(&cli.audio_file_path, &cli.cue_file_path.unwrap())?;
+    let metadata_chapters_found = false;
+
+    if !metadata_chapters_found {
+        chapterize(&cli.into())?;
+    }
 
     Ok(())
 }

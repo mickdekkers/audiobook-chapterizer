@@ -23,10 +23,12 @@ function chapterize() {
     ./target/debug/audiobook-chapterizer -vv --model ./vosk-model-en-us-0.22 \
         --write_matches "${out_dir}/${audio_name}.jsonl" \
         -i "$input_path" \
-        "${out_dir}/${audio_name}.cue" \
+        --output_cue "${out_dir}/${audio_name}.cue" \
+        --output_ffmetadata "${out_dir}/${audio_name}.ffmetadata" \
         2>&1 | tee "${out_dir}/${audio_name}.log"
 
     cp -n "${out_dir}/${audio_name}.cue" "${audio_dirname}/${audio_name}.cue"
+    cp -n "${out_dir}/${audio_name}.ffmetadata" "${audio_dirname}/${audio_name}.ffmetadata"
 
     echo "Done chapterizing ${input_path}"
 }

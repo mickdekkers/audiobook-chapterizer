@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 pub mod audio_provider;
+pub mod chapter_writer;
 pub mod chapterize;
 pub mod cue;
 pub mod extract;
+pub mod ffmetadata;
 pub mod fixed_vec_deque;
 
 pub fn format_duration(duration: &Option<Duration>) -> String {

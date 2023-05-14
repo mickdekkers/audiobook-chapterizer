@@ -4,6 +4,8 @@ use std::{io::Write, path::Path, time::Duration};
 
 use color_eyre::eyre::{self, eyre, Context};
 
+use crate::chapter_writer::ChapterWriter;
+
 /// There are 75 frames in one second
 const CUE_FRAMES_PER_SECOND: f32 = 75.0;
 
@@ -61,7 +63,7 @@ impl CueWriter {
 
         let cue_header = &format!(
             "FILE \"{}\" {}",
-            &Self::sanitize_string(&file_name),
+            &Self::sanitize_string(file_name),
             file_type
         );
 
@@ -74,7 +76,7 @@ impl CueWriter {
         Ok(())
     }
 
-    pub fn write_track(&mut self, duration: &Duration, title: &str) -> eyre::Result<()> {
+    pub fn write_track(&mut self, start_time: &Duration, title: &str) -> eyre::Result<()> {
         if !self.header_written {
             return Err(eyre!("Failed to write cue track: must write header first"));
         }
@@ -87,7 +89,7 @@ impl CueWriter {
             ",
             self.track_num,
             &Self::sanitize_string(title),
-            duration_to_cue_index(duration),
+            duration_to_cue_index(start_time),
         ));
 
         self.writer
@@ -96,6 +98,16 @@ impl CueWriter {
 
         self.track_num += 1;
 
+        Ok(())
+    }
+}
+
+impl ChapterWriter for CueWriter {
+    fn on_chapter_start(&mut self, start_time: &Duration, title: &str) -> eyre::Result<()> {
+        self.write_track(start_time, title)
+    }
+
+    fn on_end_of_file(&mut self, _file_duration: &Duration) -> eyre::Result<()> {
         Ok(())
     }
 }

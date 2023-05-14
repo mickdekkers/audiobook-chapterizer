@@ -1,10 +1,12 @@
 use crate::{
     audio_provider::AudioProvider,
+    chapter_writer::ChapterWriter,
     chapterize::{
         results_parser::{alt_contains_potential_match, ParseResult, ResultsParser},
         token::Token,
     },
     cue::CueWriter,
+    ffmetadata::FfmetadataWriter,
     fixed_vec_deque::FixedVecDeque,
     format_duration,
 };
@@ -64,7 +66,9 @@ pub struct ChapterizeOptions {
     /// The path to the audio file to chapterize.
     pub audio_file_path: PathBuf,
     /// The path that the output .cue file will be written to.
-    pub cue_file_path: PathBuf,
+    pub cue_file_path: Option<PathBuf>,
+    /// The path that the output ffmetadata file will be written to.
+    pub ffmetadata_file_path: Option<PathBuf>,
 }
 
 pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
@@ -72,6 +76,7 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
     let num_channels = 1;
     let sample_rate = ap.sample_rate();
     let total_duration = ap.total_duration();
+    let total_samples = Arc::new(AtomicU64::new(0));
 
     let calc_progress_in_secs = move |current_samples: u64| {
         current_samples as f32 / sample_rate as f32 / num_channels as f32
@@ -97,7 +102,21 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
     };
     let audio_file_path = options.audio_file_path.clone();
 
-    let cue_file = File::create(&options.cue_file_path).wrap_err("Failed to create cue file")?;
+    let cue_file = options
+        .cue_file_path
+        .as_ref()
+        .map(|cue_file_path| File::create(cue_file_path).wrap_err("Failed to create cue file"))
+        .transpose()?;
+    let ffmetadata_file = options
+        .ffmetadata_file_path
+        .as_ref()
+        .map(|ffmetadata_file_path| {
+            File::create(ffmetadata_file_path).wrap_err("Failed to create ffmetadata file")
+        })
+        .transpose()?;
+
+    let total_samples_clone = total_samples.clone();
+
     let result_processor_handle = thread::spawn(move || {
         let mut write_json_to_matches_file = |json: &str| match &mut matches_file {
             Some(matches_file) => {
@@ -113,15 +132,36 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
         let (mut results_parser, parse_result_rx) = ResultsParser::new(POST_CHAPTER_CONTEXT);
 
-        // TODO: refactor parse result processing into trait + struct impl for .cue
         let parse_result_processor_handle = thread::spawn(move || {
-            let mut cue_writer = CueWriter::new(Box::new(cue_file));
+            let mut chapter_writers = {
+                let mut chapter_writers: Vec<Box<dyn ChapterWriter>> = Vec::with_capacity(2);
 
-            cue_writer.write_header(&audio_file_path).unwrap();
+                if let Some(cue_file) = cue_file {
+                    let mut cue_writer = CueWriter::new(Box::new(cue_file));
+                    cue_writer.write_header(&audio_file_path).unwrap();
+                    chapter_writers.push(Box::new(cue_writer));
+                }
 
-            cue_writer
-                .write_track(&Duration::ZERO, "Chapter 00")
-                .unwrap();
+                if let Some(ffmetadata_file) = ffmetadata_file {
+                    let mut ffmetadata_writer = FfmetadataWriter::new(Box::new(ffmetadata_file));
+                    ffmetadata_writer.write_header().unwrap();
+                    chapter_writers.push(Box::new(ffmetadata_writer));
+                }
+
+                chapter_writers
+            };
+
+            if chapter_writers.is_empty() {
+                unreachable!(
+                    "No chapter writers specified, cli args validation should have caught this"
+                );
+            }
+
+            for chapter_writer in chapter_writers.iter_mut() {
+                chapter_writer
+                    .on_chapter_start(&Duration::ZERO, "Chapter 00")
+                    .unwrap();
+            }
 
             while let Ok(parse_result) = parse_result_rx.recv() {
                 // TODO: filter out duplicate chapters
@@ -143,15 +183,28 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
                     format_duration(&Some(chapter_start_duration))
                 );
 
-                cue_writer
-                    .write_track(
-                        &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN)),
-                        &format!(
-                            "Chapter {:02}",
-                            parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap()
-                        ),
-                    )
-                    .unwrap();
+                for chapter_writer in chapter_writers.iter_mut() {
+                    chapter_writer
+                        .on_chapter_start(
+                            &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN)),
+                            &format!(
+                                "Chapter {:02}",
+                                parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap()
+                            ),
+                        )
+                        .unwrap();
+                }
+            }
+
+            // Since the duration in the file's metadata may be missing or inaccurate, we'll
+            // calculate the total file duration based on the number of samples processed.
+            let processed_duration = Duration::from_secs_f32(calc_progress_in_secs(
+                total_samples_clone.load(Ordering::SeqCst),
+            ));
+
+            // TODO: don't call this if parse_result_rx was closed due to CTRL+C
+            for chapter_writer in chapter_writers.iter_mut() {
+                chapter_writer.on_end_of_file(&processed_duration).unwrap();
             }
         });
 
@@ -191,7 +244,6 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
     });
 
     assert!(ETA_CALC_WINDOW > 0);
-    let total_samples = Arc::new(AtomicU64::new(0));
     let (progress_reporter_stop_tx, progress_reporter_stop_rx) = channel::unbounded::<()>();
     let total_samples_clone = total_samples.clone();
     let progress_reporter_handle = thread::spawn(move || {
