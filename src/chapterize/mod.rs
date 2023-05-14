@@ -282,7 +282,7 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
             let (remaining_wall_time, eta) = match total_duration {
                 Some(total_duration) => {
-                    let remaining_to_process = total_duration - processed_duration;
+                    let remaining_to_process = total_duration.saturating_sub(processed_duration);
                     let remaining_wall_time = Duration::from_secs_f32(
                         remaining_to_process.as_secs_f32() / avg_speed_factor,
                     );
