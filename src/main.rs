@@ -83,9 +83,12 @@ fn main() -> Result<(), eyre::Error> {
 
     // TODO: add option/subcommand to skip metadata extraction and force ASR instead
     // TODO: add force-extract flag and force-asr (or similar) flag
-    // let metadata_chapters_found =
-    //     extract_chapters(&cli.audio_file_path, &cli.cue_file_path.unwrap())?;
-    let metadata_chapters_found = false;
+    let metadata_chapters_found = if let Some(cue_file_path) = &cli.outputs.cue_file_path {
+        extract_chapters(&cli.audio_file_path, cue_file_path)?
+    } else {
+        log::warn!("No cue file path provided, skipping metadata extraction");
+        false
+    };
 
     if !metadata_chapters_found {
         chapterize(&cli.into())?;
