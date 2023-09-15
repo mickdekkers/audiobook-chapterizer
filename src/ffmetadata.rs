@@ -53,8 +53,8 @@ impl FfmetadataWriter {
 
     pub fn write_chapter(
         &mut self,
-        start_time: &Duration,
-        end_time: &Duration,
+        start_time: Duration,
+        end_time: Duration,
         title: &str,
     ) -> eyre::Result<()> {
         if !self.header_written {
@@ -85,19 +85,19 @@ impl FfmetadataWriter {
 }
 
 impl ChapterWriter for FfmetadataWriter {
-    fn on_chapter_start(&mut self, start_time: &Duration, title: &str) -> eyre::Result<()> {
+    fn on_chapter_start(&mut self, start_time: Duration, title: &str) -> eyre::Result<()> {
         if let Some((prev_start_time, prev_title)) = self.partial_chapter.take() {
-            self.write_chapter(&prev_start_time, start_time, &prev_title)?;
+            self.write_chapter(prev_start_time, start_time, &prev_title)?;
         }
 
-        self.partial_chapter = Some((*start_time, title.to_string()));
+        self.partial_chapter = Some((start_time, title.to_string()));
 
         Ok(())
     }
 
-    fn on_end_of_file(&mut self, file_duration: &Duration) -> eyre::Result<()> {
+    fn on_end_of_file(&mut self, file_duration: Duration) -> eyre::Result<()> {
         if let Some((start_time, title)) = self.partial_chapter.take() {
-            self.write_chapter(&start_time, file_duration, &title)?;
+            self.write_chapter(start_time, file_duration, &title)?;
         }
 
         Ok(())

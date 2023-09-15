@@ -159,7 +159,7 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
             for chapter_writer in chapter_writers.iter_mut() {
                 chapter_writer
-                    .on_chapter_start(&Duration::ZERO, "Chapter 00")
+                    .on_chapter_start(Duration::ZERO, "Chapter 00")
                     .unwrap();
             }
 
@@ -186,7 +186,7 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
                 for chapter_writer in chapter_writers.iter_mut() {
                     chapter_writer
                         .on_chapter_start(
-                            &(chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN)),
+                            chapter_start_duration.saturating_sub(PRE_CHAPTER_START_MARGIN),
                             &format!(
                                 "Chapter {:02}",
                                 parsed_chapter.get(1).unwrap().word.parse::<f32>().unwrap()
@@ -204,7 +204,7 @@ pub fn chapterize(options: &ChapterizeOptions) -> Result<(), eyre::Error> {
 
             // TODO: don't call this if parse_result_rx was closed due to CTRL+C
             for chapter_writer in chapter_writers.iter_mut() {
-                chapter_writer.on_end_of_file(&processed_duration).unwrap();
+                chapter_writer.on_end_of_file(processed_duration).unwrap();
             }
         });
 

@@ -1,6 +1,6 @@
 use audiobook_chapterizer::{
     chapterize::{chapterize, ChapterizeOptions},
-    extract::extract_chapters,
+    extract::{extract_chapters, ExtractOptions},
 };
 use clap::{
     builder::{OsStringValueParser, TypedValueParser},
@@ -23,7 +23,7 @@ fn verify_jsonl_ext(os: OsString) -> Result<PathBuf, &'static str> {
     Ok(path)
 }
 
-#[derive(Args)]
+#[derive(Args, Clone, Debug)]
 #[group(required = true, multiple = true)]
 struct Outputs {
     // TODO: verify extension of .cue
@@ -35,7 +35,7 @@ struct Outputs {
     ffmetadata_file_path: Option<PathBuf>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone, Debug)]
 struct Cli {
     /// Makes logging more verbose. Pass once for debug log level, twice for trace log level.
     #[arg(short, action = ArgAction::Count, global = true)]
@@ -70,6 +70,16 @@ impl From<Cli> for ChapterizeOptions {
     }
 }
 
+impl From<Cli> for ExtractOptions {
+    fn from(val: Cli) -> Self {
+        ExtractOptions {
+            audio_file_path: val.audio_file_path,
+            cue_file_path: val.outputs.cue_file_path,
+            ffmetadata_file_path: val.outputs.ffmetadata_file_path,
+        }
+    }
+}
+
 fn main() -> Result<(), eyre::Error> {
     color_eyre::install()?;
     let cli = Cli::parse();
@@ -83,12 +93,7 @@ fn main() -> Result<(), eyre::Error> {
 
     // TODO: add option/subcommand to skip metadata extraction and force ASR instead
     // TODO: add force-extract flag and force-asr (or similar) flag
-    let metadata_chapters_found = if let Some(cue_file_path) = &cli.outputs.cue_file_path {
-        extract_chapters(&cli.audio_file_path, cue_file_path)?
-    } else {
-        log::warn!("No cue file path provided, skipping metadata extraction");
-        false
-    };
+    let metadata_chapters_found = extract_chapters(&cli.clone().into())?;
 
     if !metadata_chapters_found {
         chapterize(&cli.into())?;

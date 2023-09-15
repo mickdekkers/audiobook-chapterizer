@@ -9,7 +9,7 @@ use crate::chapter_writer::ChapterWriter;
 /// There are 75 frames in one second
 const CUE_FRAMES_PER_SECOND: f32 = 75.0;
 
-pub fn duration_to_cue_index(duration: &Duration) -> String {
+pub fn duration_to_cue_index(duration: Duration) -> String {
     let frames = (duration.subsec_millis() as f32 / 1000.0 * CUE_FRAMES_PER_SECOND) as u32;
     let seconds = duration.as_secs() % 60;
     let minutes = duration.as_secs() / 60; // integer divison, no need to floor
@@ -76,7 +76,7 @@ impl CueWriter {
         Ok(())
     }
 
-    pub fn write_track(&mut self, start_time: &Duration, title: &str) -> eyre::Result<()> {
+    pub fn write_track(&mut self, start_time: Duration, title: &str) -> eyre::Result<()> {
         if !self.header_written {
             return Err(eyre!("Failed to write cue track: must write header first"));
         }
@@ -103,11 +103,11 @@ impl CueWriter {
 }
 
 impl ChapterWriter for CueWriter {
-    fn on_chapter_start(&mut self, start_time: &Duration, title: &str) -> eyre::Result<()> {
+    fn on_chapter_start(&mut self, start_time: Duration, title: &str) -> eyre::Result<()> {
         self.write_track(start_time, title)
     }
 
-    fn on_end_of_file(&mut self, _file_duration: &Duration) -> eyre::Result<()> {
+    fn on_end_of_file(&mut self, _file_duration: Duration) -> eyre::Result<()> {
         Ok(())
     }
 }
