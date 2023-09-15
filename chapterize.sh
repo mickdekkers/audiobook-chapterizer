@@ -37,6 +37,10 @@ just build
 
 while read -r file_path; do
     set +e
+    if [[ "$file_path" =~ ^#.* ]]; then
+        echo "Skipping comment: $file_path"
+        continue
+    fi
     chapterize "$file_path" ./output
     set -e
 done < ./chapterize.txt
